@@ -1,0 +1,588 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Presupuestos de obra — Albañilería</title>
+
+<!-- Tailwind por CDN: si preferís no depender de un CDN, instalá tailwind en tu proyecto
+     y reemplazá esta línea por tu propio build de CSS. -->
+<script src="https://cdn.tailwindcss.com"></script>
+
+<!-- Iconos (lucide) -->
+<script src="https://unpkg.com/lucide@latest/dist/umd/lucide.js"></script>
+
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Oswald:wght@500;600;700&family=JetBrains+Mono:wght@400;600;700&display=swap');
+
+  body {
+    background-color: #fffbeb;
+    background-image:
+      linear-gradient(rgba(87,83,78,0.06) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(87,83,78,0.06) 1px, transparent 1px);
+    background-size: 22px 22px;
+    margin: 0;
+  }
+  .font-display { font-family: 'Oswald', sans-serif; }
+  .font-ledger  { font-family: 'JetBrains Mono', monospace; }
+
+  /* tira de "perforación" tipo talonario de remitos */
+  .perforacion {
+    height: 10px;
+    background-image: radial-gradient(circle, #a8a29e 2.5px, transparent 2.6px);
+    background-size: 18px 10px;
+    background-repeat: repeat-x;
+    background-position: center;
+  }
+
+  @media print {
+    .no-imprimir { display: none !important; }
+  }
+</style>
+</head>
+<body class="text-stone-900">
+
+<div id="app"></div>
+
+<script>
+/* =========================================================
+   DATOS / CONSTANTES
+   ========================================================= */
+const STORAGE_KEY = 'presupuestos_albanileria_v1';
+
+const UNIDADES = ['bolsa', 'm2', 'm3', 'kg', 'ml', 'unidad', 'litro', 'hora', 'día', 'global'];
+
+const CATEGORIAS = [
+  { key: 'materiales', label: 'Materiales' },
+  { key: 'mano_obra',  label: 'Mano de obra' },
+  { key: 'otros',      label: 'Otros gastos' },
+];
+
+const ITEMS_FRECUENTES = {
+  materiales: [
+    ['Cemento', 'bolsa'], ['Cal', 'bolsa'], ['Arena', 'm3'], ['Piedra partida', 'm3'],
+    ['Ladrillo hueco 12x18x33', 'unidad'], ['Ladrillo común', 'unidad'],
+    ['Hierro del 6', 'unidad'], ['Hierro del 8', 'unidad'], ['Hierro del 10', 'unidad'],
+    ['Alambre para atar', 'kg'], ['Malla sima', 'unidad'], ['Cerámico para piso', 'm2'],
+    ['Pegamento cerámico', 'bolsa'], ['Pastina', 'kg'], ['Enduido', 'bolsa'], ['Pintura látex', 'litro'],
+  ],
+  mano_obra: [
+    ['Oficial albañil', 'día'], ['Ayudante', 'día'], ['Cuadrilla completa', 'día'],
+  ],
+  otros: [
+    ['Flete', 'global'], ['Volquete', 'unidad'], ['Alquiler de andamios', 'día'],
+  ],
+};
+
+/* =========================================================
+   HELPERS
+   ========================================================= */
+const generarId = () => `${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
+
+const presupuestoVacio = () => ({
+  id: generarId(),
+  cliente: '',
+  obra: '',
+  fecha: new Date().toISOString().slice(0, 10),
+  items: [],
+  margen: '',
+  descuento: '',
+});
+
+const num = (v) => { const n = Number(v); return isNaN(n) ? 0 : n; };
+
+const formatMoney = (n) =>
+  new Intl.NumberFormat('es-AR', { style: 'currency', currency: 'ARS', maximumFractionDigits: 0 }).format(n || 0);
+
+const formatFecha = (iso) => {
+  if (!iso) return '-';
+  const [y, m, d] = iso.split('-');
+  return `${d}/${m}/${y}`;
+};
+
+// escape básico para no romper el HTML con lo que el usuario tipea
+const esc = (str) => String(str ?? '')
+  .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+
+function calcularTotales(p) {
+  const subtotalCat = (cat) =>
+    p.items.filter(i => i.categoria === cat).reduce((s, i) => s + num(i.cantidad) * num(i.precioUnitario), 0);
+  const subMateriales = subtotalCat('materiales');
+  const subManoObra   = subtotalCat('mano_obra');
+  const subOtros      = subtotalCat('otros');
+  const subGeneral    = subMateriales + subManoObra + subOtros;
+  const montoGanancia = subGeneral * num(p.margen) / 100;
+  const totalConGanancia = subGeneral + montoGanancia;
+  const montoDescuento = totalConGanancia * num(p.descuento) / 100;
+  const totalFinal = totalConGanancia - montoDescuento;
+  return { subMateriales, subManoObra, subOtros, subGeneral, montoGanancia, totalConGanancia, montoDescuento, totalFinal };
+}
+
+/* =========================================================
+   ESTADO
+   ========================================================= */
+let state = {
+  vista: 'lista',            // 'lista' | 'editor' | 'resumen'
+  presupuestos: [],
+  actual: null,
+  confirmarBorrar: null,
+  menuFrecuentes: null,
+  guardadoOk: false,
+  errorGuardado: false,
+  copiado: false,
+};
+
+function cargarPresupuestos() {
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY);
+    state.presupuestos = raw ? JSON.parse(raw) : [];
+  } catch (e) {
+    state.presupuestos = [];
+  }
+}
+
+function persistir(lista) {
+  state.presupuestos = lista;
+  try {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(lista));
+    state.errorGuardado = false;
+    return true;
+  } catch (e) {
+    state.errorGuardado = true;
+    return false;
+  }
+}
+
+/* =========================================================
+   ACCIONES
+   ========================================================= */
+function nuevoPresupuesto() {
+  state.actual = presupuestoVacio();
+  state.vista = 'editor';
+  render();
+}
+
+function editar(id) {
+  const p = state.presupuestos.find(p => p.id === id);
+  if (!p) return;
+  state.actual = JSON.parse(JSON.stringify(p));
+  state.vista = 'editor';
+  render();
+}
+
+function duplicar(id) {
+  const p = state.presupuestos.find(p => p.id === id);
+  if (!p) return;
+  const copia = JSON.parse(JSON.stringify(p));
+  copia.id = generarId();
+  copia.fecha = new Date().toISOString().slice(0, 10);
+  copia.items = copia.items.map(i => ({ ...i, id: generarId() }));
+  state.actual = copia;
+  state.vista = 'editor';
+  render();
+}
+
+function borrar(id) {
+  persistir(state.presupuestos.filter(p => p.id !== id));
+  state.confirmarBorrar = null;
+  render();
+}
+
+function agregarItem(categoria, prefill) {
+  state.actual.items.push({
+    id: generarId(),
+    categoria,
+    descripcion: prefill ? prefill[0] : '',
+    unidad: prefill ? prefill[1] : 'unidad',
+    cantidad: 1,
+    precioUnitario: '',
+  });
+  state.menuFrecuentes = null;
+  render();
+}
+
+function quitarItem(id) {
+  state.actual.items = state.actual.items.filter(i => i.id !== id);
+  render();
+}
+
+function guardar() {
+  const existe = state.presupuestos.some(p => p.id === state.actual.id);
+  const nuevaLista = existe
+    ? state.presupuestos.map(p => p.id === state.actual.id ? state.actual : p)
+    : [...state.presupuestos, state.actual];
+  const ok = persistir(nuevaLista);
+  if (ok) {
+    state.guardadoOk = true;
+    render();
+    setTimeout(() => { state.guardadoOk = false; render(); }, 2000);
+  } else {
+    render();
+  }
+  return ok;
+}
+
+function irAResumen() {
+  guardar();
+  state.vista = 'resumen';
+  render();
+}
+
+function volverALista() {
+  state.actual = null;
+  state.vista = 'lista';
+  render();
+}
+
+function copiarTexto() {
+  const a = state.actual;
+  const t = calcularTotales(a);
+  let texto = `PRESUPUESTO DE OBRA\n`;
+  texto += `Cliente: ${a.cliente || '-'}\n`;
+  texto += `Obra: ${a.obra || '-'}\n`;
+  texto += `Fecha: ${formatFecha(a.fecha)}\n\n`;
+  CATEGORIAS.forEach(cat => {
+    const items = a.items.filter(i => i.categoria === cat.key);
+    if (items.length === 0) return;
+    texto += `${cat.label.toUpperCase()}\n`;
+    items.forEach(i => {
+      const sub = num(i.cantidad) * num(i.precioUnitario);
+      texto += `- ${i.descripcion || '(sin descripción)'}: ${i.cantidad || 0} ${i.unidad} x ${formatMoney(i.precioUnitario)} = ${formatMoney(sub)}\n`;
+    });
+    texto += `\n`;
+  });
+  texto += `Subtotal: ${formatMoney(t.subGeneral)}\n`;
+  if (num(a.margen) > 0) texto += `Ganancia (${a.margen}%): ${formatMoney(t.montoGanancia)}\n`;
+  if (num(a.descuento) > 0) texto += `Descuento (${a.descuento}%): -${formatMoney(t.montoDescuento)}\n`;
+  texto += `TOTAL: ${formatMoney(t.totalFinal)}`;
+
+  navigator.clipboard.writeText(texto).then(() => {
+    state.copiado = true;
+    render();
+    setTimeout(() => { state.copiado = false; render(); }, 2000);
+  }).catch(() => {});
+}
+
+/* =========================================================
+   VISTAS (devuelven strings de HTML)
+   ========================================================= */
+function renderLista() {
+  const items = state.presupuestos.slice().sort((a, b) => (b.fecha || '').localeCompare(a.fecha || ''));
+  const contadorTexto = state.presupuestos.length === 1 ? 'presupuesto guardado' : 'presupuestos guardados';
+
+  const listaHtml = items.map(p => {
+    const t = calcularTotales(p);
+    const confirmando = state.confirmarBorrar === p.id;
+    return `
+      <div class="bg-white border border-stone-300 shadow-sm mb-4">
+        <div class="perforacion"></div>
+        <div class="p-4">
+          <div class="flex justify-between items-start gap-2">
+            <div>
+              <h2 class="font-display text-lg text-stone-900">${esc(p.cliente) || 'Sin nombre de cliente'}</h2>
+              <p class="text-stone-500 text-sm">${esc(p.obra) || 'Sin descripción de obra'}</p>
+              <p class="text-stone-400 text-xs mt-1">${formatFecha(p.fecha)}</p>
+            </div>
+            <p class="font-ledger text-red-700 font-bold text-xl whitespace-nowrap">${formatMoney(t.totalFinal)}</p>
+          </div>
+          ${confirmando ? `
+            <div class="flex items-center gap-3 mt-3 border-t border-stone-200 pt-3">
+              <span class="text-sm text-stone-700">¿Eliminar este presupuesto?</span>
+              <button data-action="borrar" data-id="${p.id}" class="text-red-700 text-sm font-semibold hover:underline">Sí, eliminar</button>
+              <button data-action="cancelar-borrar" class="text-stone-500 text-sm hover:underline">Cancelar</button>
+            </div>
+          ` : `
+            <div class="flex items-center gap-4 mt-3 border-t border-stone-200 pt-3">
+              <button data-action="editar" data-id="${p.id}" class="flex items-center gap-1 text-stone-600 hover:text-stone-900 text-sm"><i data-lucide="pencil" class="w-3.5 h-3.5"></i> Editar</button>
+              <button data-action="duplicar" data-id="${p.id}" class="flex items-center gap-1 text-stone-600 hover:text-stone-900 text-sm"><i data-lucide="copy" class="w-3.5 h-3.5"></i> Duplicar</button>
+              <button data-action="pedir-borrar" data-id="${p.id}" class="flex items-center gap-1 text-stone-600 hover:text-red-700 text-sm"><i data-lucide="trash-2" class="w-3.5 h-3.5"></i> Eliminar</button>
+            </div>
+          `}
+        </div>
+      </div>
+    `;
+  }).join('');
+
+  return `
+    <div class="max-w-3xl mx-auto px-4 py-6">
+      <header class="bg-stone-900 text-amber-50 px-5 py-4 mb-6 flex items-center gap-3">
+        <i data-lucide="hard-hat" class="text-amber-400 shrink-0 w-7 h-7"></i>
+        <div>
+          <h1 class="font-display uppercase tracking-wide text-xl leading-tight">Presupuestos de obra</h1>
+          <p class="text-amber-500 text-xs uppercase tracking-widest">Albañilería</p>
+        </div>
+      </header>
+
+      <div class="flex justify-between items-center mb-4 gap-3">
+        <p class="text-stone-600 text-sm">${state.presupuestos.length} ${contadorTexto}</p>
+        <button data-action="nuevo" class="flex items-center gap-1 bg-red-700 hover:bg-red-800 text-white font-display uppercase tracking-wide text-sm px-4 py-2 shrink-0">
+          <i data-lucide="plus" class="w-4 h-4"></i> Nuevo presupuesto
+        </button>
+      </div>
+
+      ${state.presupuestos.length === 0 ? `
+        <div class="border-2 border-dashed border-stone-300 p-8 text-center">
+          <i data-lucide="hard-hat" class="mx-auto mb-3 text-stone-400 w-8 h-8"></i>
+          <p class="text-stone-600 mb-4">Todavía no armaste ningún presupuesto.<br>Empezá cargando los datos de tu primera obra.</p>
+          <button data-action="nuevo" class="bg-red-700 hover:bg-red-800 text-white font-display uppercase tracking-wide text-sm px-4 py-2">Crear el primero</button>
+        </div>
+      ` : `<div>${listaHtml}</div>`}
+    </div>
+  `;
+}
+
+function renderEditor() {
+  const a = state.actual;
+  const t = calcularTotales(a);
+
+  const seccionesHtml = CATEGORIAS.map(cat => {
+    const items = a.items.filter(i => i.categoria === cat.key);
+    const subtotalCat = items.reduce((s, i) => s + num(i.cantidad) * num(i.precioUnitario), 0);
+
+    const filasHtml = items.map(item => `
+      <div class="grid grid-cols-1 sm:grid-cols-12 gap-2 items-center border-b border-stone-100 pb-2 sm:border-0 sm:pb-0">
+        <input data-item-id="${item.id}" data-item-campo="descripcion" data-key="item-${item.id}-descripcion" value="${esc(item.descripcion)}" placeholder="Descripción" class="sm:col-span-5 border border-stone-300 px-2 py-1.5 text-sm focus:outline-none focus:border-red-700">
+        <select data-item-id="${item.id}" data-item-campo="unidad" data-key="item-${item.id}-unidad" class="sm:col-span-2 border border-stone-300 px-2 py-1.5 text-sm focus:outline-none focus:border-red-700">
+          ${UNIDADES.map(u => `<option value="${u}" ${u === item.unidad ? 'selected' : ''}>${u}</option>`).join('')}
+        </select>
+        <input type="number" data-item-id="${item.id}" data-item-campo="cantidad" data-key="item-${item.id}-cantidad" value="${esc(item.cantidad)}" placeholder="Cant." class="sm:col-span-2 border border-stone-300 px-2 py-1.5 text-sm font-ledger focus:outline-none focus:border-red-700">
+        <input type="number" data-item-id="${item.id}" data-item-campo="precioUnitario" data-key="item-${item.id}-precio" value="${esc(item.precioUnitario)}" placeholder="Precio" class="sm:col-span-2 border border-stone-300 px-2 py-1.5 text-sm font-ledger focus:outline-none focus:border-red-700">
+        <div class="sm:col-span-1 flex items-center justify-between sm:justify-end gap-2">
+          <span class="font-ledger text-sm text-stone-700 sm:hidden">Subt:</span>
+          <span class="font-ledger text-sm text-stone-700">${formatMoney(num(item.cantidad) * num(item.precioUnitario))}</span>
+          <button data-action="quitar-item" data-id="${item.id}" class="text-stone-400 hover:text-red-700"><i data-lucide="x" class="w-4 h-4"></i></button>
+        </div>
+      </div>
+    `).join('');
+
+    const frecuentesHtml = ITEMS_FRECUENTES[cat.key].map(([desc, uni]) => `
+      <button data-action="agregar-frecuente" data-cat="${cat.key}" data-desc="${esc(desc)}" data-uni="${uni}" class="block w-full text-left px-3 py-2 text-sm hover:bg-amber-50 border-b border-stone-100 last:border-0">${desc} <span class="text-stone-400">(${uni})</span></button>
+    `).join('');
+
+    return `
+      <div class="bg-white border border-stone-300 mb-4">
+        <div class="flex justify-between items-center bg-stone-100 border-b border-stone-300 px-3 py-2">
+          <h3 class="font-display uppercase tracking-wide text-stone-800 text-sm">${cat.label}</h3>
+          <span class="font-ledger text-stone-700 text-sm">${formatMoney(subtotalCat)}</span>
+        </div>
+        <div class="p-3">
+          ${items.length > 0 ? `
+            <div class="hidden sm:grid grid-cols-12 gap-2 text-xs uppercase tracking-wide text-stone-400 mb-1 px-1">
+              <span class="col-span-5">Descripción</span>
+              <span class="col-span-2">Unidad</span>
+              <span class="col-span-2">Cantidad</span>
+              <span class="col-span-2">Precio unit.</span>
+              <span class="col-span-1 text-right">Subt.</span>
+            </div>
+          ` : ''}
+          <div class="flex flex-col gap-2">${filasHtml}</div>
+          <div class="flex items-center gap-2 mt-3 relative flex-wrap">
+            <button data-action="agregar-item" data-cat="${cat.key}" class="flex items-center gap-1 text-sm text-stone-700 border border-stone-300 hover:border-stone-400 px-3 py-1.5"><i data-lucide="plus" class="w-3.5 h-3.5"></i> Agregar item</button>
+            <button data-action="toggle-frecuentes" data-cat="${cat.key}" class="flex items-center gap-1 text-sm text-stone-700 border border-stone-300 hover:border-stone-400 px-3 py-1.5">Frecuentes <i data-lucide="chevron-down" class="w-3.5 h-3.5"></i></button>
+            ${state.menuFrecuentes === cat.key ? `<div class="absolute top-full left-0 mt-1 bg-white border border-stone-300 shadow-md z-10 max-h-56 overflow-y-auto w-64">${frecuentesHtml}</div>` : ''}
+          </div>
+        </div>
+      </div>
+    `;
+  }).join('');
+
+  return `
+    <div class="max-w-3xl mx-auto px-4 py-6 pb-10">
+      <div class="flex items-center justify-between mb-5">
+        <button data-action="volver-lista" class="flex items-center gap-1 text-stone-600 hover:text-stone-900 text-sm"><i data-lucide="arrow-left" class="w-4 h-4"></i> Volver</button>
+        ${state.guardadoOk ? '<span class="text-emerald-700 text-sm font-semibold">Guardado ✓</span>' : ''}
+        ${state.errorGuardado ? '<span class="text-red-700 text-sm font-semibold">No se pudo guardar, reintentá</span>' : ''}
+      </div>
+
+      <div class="bg-white border border-stone-300 p-4 mb-4">
+        <div class="grid grid-cols-1 sm:grid-cols-3 gap-3">
+          <div>
+            <label class="block text-xs uppercase tracking-wide text-stone-500 mb-1">Cliente</label>
+            <input data-campo="cliente" data-key="campo-cliente" value="${esc(a.cliente)}" placeholder="Nombre del cliente" class="w-full border border-stone-300 px-3 py-2 text-sm focus:outline-none focus:border-red-700">
+          </div>
+          <div>
+            <label class="block text-xs uppercase tracking-wide text-stone-500 mb-1">Obra / Dirección</label>
+            <input data-campo="obra" data-key="campo-obra" value="${esc(a.obra)}" placeholder="Dirección o descripción" class="w-full border border-stone-300 px-3 py-2 text-sm focus:outline-none focus:border-red-700">
+          </div>
+          <div>
+            <label class="block text-xs uppercase tracking-wide text-stone-500 mb-1">Fecha</label>
+            <input type="date" data-campo="fecha" data-key="campo-fecha" value="${esc(a.fecha)}" class="w-full border border-stone-300 px-3 py-2 text-sm focus:outline-none focus:border-red-700">
+          </div>
+        </div>
+      </div>
+
+      ${seccionesHtml}
+
+      <div class="bg-stone-900 text-amber-50 p-4">
+        <div class="flex flex-col gap-1 text-sm text-stone-300 mb-3">
+          <div class="flex justify-between"><span>Materiales</span><span class="font-ledger">${formatMoney(t.subMateriales)}</span></div>
+          <div class="flex justify-between"><span>Mano de obra</span><span class="font-ledger">${formatMoney(t.subManoObra)}</span></div>
+          <div class="flex justify-between"><span>Otros gastos</span><span class="font-ledger">${formatMoney(t.subOtros)}</span></div>
+        </div>
+        <div class="flex justify-between text-base font-semibold border-t border-stone-700 pt-2 mb-3">
+          <span>Subtotal general</span><span class="font-ledger">${formatMoney(t.subGeneral)}</span>
+        </div>
+        <div class="grid grid-cols-2 gap-3 mb-3">
+          <div>
+            <label class="block text-xs uppercase tracking-wide text-stone-400 mb-1">Ganancia (%)</label>
+            <input type="number" data-campo="margen" data-key="campo-margen" value="${esc(a.margen)}" placeholder="0" class="w-full border border-stone-700 bg-stone-800 px-2 py-1.5 text-sm font-ledger focus:outline-none focus:border-amber-400">
+          </div>
+          <div>
+            <label class="block text-xs uppercase tracking-wide text-stone-400 mb-1">Descuento (%)</label>
+            <input type="number" data-campo="descuento" data-key="campo-descuento" value="${esc(a.descuento)}" placeholder="0" class="w-full border border-stone-700 bg-stone-800 px-2 py-1.5 text-sm font-ledger focus:outline-none focus:border-amber-400">
+          </div>
+        </div>
+        <div class="flex justify-between items-center border-t border-stone-700 pt-3">
+          <span class="font-display uppercase tracking-wide text-lg">Total final</span>
+          <span class="font-ledger text-amber-400 text-2xl font-bold">${formatMoney(t.totalFinal)}</span>
+        </div>
+      </div>
+
+      <div class="flex gap-3 mt-4">
+        <button data-action="guardar" class="flex-1 bg-red-700 hover:bg-red-800 text-white font-display uppercase tracking-wide text-sm py-2.5">Guardar</button>
+        <button data-action="ver-resumen" class="flex-1 border border-stone-400 text-stone-700 hover:bg-stone-100 font-display uppercase tracking-wide text-sm py-2.5">Ver y compartir</button>
+      </div>
+    </div>
+  `;
+}
+
+function renderResumen() {
+  const a = state.actual;
+  const t = calcularTotales(a);
+
+  const seccionesHtml = CATEGORIAS.map(cat => {
+    const items = a.items.filter(i => i.categoria === cat.key);
+    if (items.length === 0) return '';
+    const filas = items.map(i => `
+      <div class="flex justify-between text-sm py-1 gap-3">
+        <span>${esc(i.descripcion) || '(sin descripción)'} <span class="text-stone-400">— ${i.cantidad || 0} ${i.unidad} x ${formatMoney(i.precioUnitario)}</span></span>
+        <span class="font-ledger whitespace-nowrap">${formatMoney(num(i.cantidad) * num(i.precioUnitario))}</span>
+      </div>
+    `).join('');
+    return `
+      <div class="mb-4">
+        <h3 class="font-display uppercase tracking-wide text-sm text-stone-700 border-b border-stone-300 pb-1 mb-2">${cat.label}</h3>
+        ${filas}
+      </div>
+    `;
+  }).join('');
+
+  return `
+    <div class="max-w-2xl mx-auto px-4 py-6">
+      <div class="flex justify-between items-center mb-5 no-imprimir flex-wrap gap-2">
+        <button data-action="volver-editor" class="flex items-center gap-1 text-stone-600 hover:text-stone-900 text-sm"><i data-lucide="arrow-left" class="w-4 h-4"></i> Volver a editar</button>
+        <div class="flex gap-2">
+          <button data-action="copiar-texto" class="flex items-center gap-1 border border-stone-300 hover:border-stone-400 text-sm px-3 py-1.5"><i data-lucide="clipboard-check" class="w-3.5 h-3.5"></i> ${state.copiado ? 'Copiado ✓' : 'Copiar texto'}</button>
+          <button data-action="imprimir" class="flex items-center gap-1 border border-stone-300 hover:border-stone-400 text-sm px-3 py-1.5"><i data-lucide="printer" class="w-3.5 h-3.5"></i> Imprimir</button>
+        </div>
+      </div>
+
+      <div class="bg-white border border-stone-300 p-6">
+        <div class="border-b-4 border-double border-red-700 pb-3 mb-4">
+          <h1 class="font-display uppercase tracking-wide text-2xl text-stone-900">Presupuesto de obra</h1>
+          <p class="text-stone-500 text-sm uppercase tracking-widest">Albañilería</p>
+        </div>
+
+        <div class="grid grid-cols-1 sm:grid-cols-3 gap-2 text-sm mb-5">
+          <p><span class="text-stone-400 uppercase text-xs block">Cliente</span>${esc(a.cliente) || '-'}</p>
+          <p><span class="text-stone-400 uppercase text-xs block">Obra</span>${esc(a.obra) || '-'}</p>
+          <p><span class="text-stone-400 uppercase text-xs block">Fecha</span>${formatFecha(a.fecha)}</p>
+        </div>
+
+        ${seccionesHtml}
+
+        <div class="border-t border-stone-300 pt-3 mt-4 flex flex-col gap-1 text-sm">
+          <div class="flex justify-between text-stone-600"><span>Subtotal</span><span class="font-ledger">${formatMoney(t.subGeneral)}</span></div>
+          ${num(a.margen) > 0 ? `<div class="flex justify-between text-emerald-700"><span>Ganancia (${a.margen}%)</span><span class="font-ledger">${formatMoney(t.montoGanancia)}</span></div>` : ''}
+          ${num(a.descuento) > 0 ? `<div class="flex justify-between text-amber-700"><span>Descuento (${a.descuento}%)</span><span class="font-ledger">-${formatMoney(t.montoDescuento)}</span></div>` : ''}
+        </div>
+
+        <div class="flex justify-end mt-5">
+          <div class="-rotate-2 border-4 border-double border-red-700 px-5 py-2 inline-block">
+            <p class="font-display uppercase tracking-wide text-xs text-red-700 text-center">Total</p>
+            <p class="font-ledger text-red-700 text-2xl font-bold">${formatMoney(t.totalFinal)}</p>
+          </div>
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+/* =========================================================
+   RENDER PRINCIPAL (con preservación de foco/cursor)
+   ========================================================= */
+function render() {
+  const app = document.getElementById('app');
+
+  const focused = document.activeElement;
+  const focusKey = focused && focused.dataset ? focused.dataset.key : null;
+  let selStart = null, selEnd = null;
+  if (focused && typeof focused.selectionStart === 'number') {
+    selStart = focused.selectionStart;
+    selEnd = focused.selectionEnd;
+  }
+
+  if (state.vista === 'lista') app.innerHTML = renderLista();
+  else if (state.vista === 'editor' && state.actual) app.innerHTML = renderEditor();
+  else if (state.vista === 'resumen' && state.actual) app.innerHTML = renderResumen();
+
+  if (window.lucide) lucide.createIcons();
+
+  if (focusKey) {
+    const el = app.querySelector(`[data-key="${focusKey}"]`);
+    if (el) {
+      el.focus();
+      if (selStart !== null && el.setSelectionRange) {
+        try { el.setSelectionRange(selStart, selEnd); } catch (e) {}
+      }
+    }
+  }
+}
+
+/* =========================================================
+   EVENTOS (delegados en document)
+   ========================================================= */
+document.addEventListener('click', (e) => {
+  const btn = e.target.closest('[data-action]');
+  if (!btn) return;
+  const action = btn.dataset.action;
+  const id = btn.dataset.id;
+
+  if (action === 'nuevo') nuevoPresupuesto();
+  else if (action === 'editar') editar(id);
+  else if (action === 'duplicar') duplicar(id);
+  else if (action === 'pedir-borrar') { state.confirmarBorrar = id; render(); }
+  else if (action === 'cancelar-borrar') { state.confirmarBorrar = null; render(); }
+  else if (action === 'borrar') borrar(id);
+  else if (action === 'volver-lista') volverALista();
+  else if (action === 'agregar-item') agregarItem(btn.dataset.cat);
+  else if (action === 'toggle-frecuentes') { state.menuFrecuentes = state.menuFrecuentes === btn.dataset.cat ? null : btn.dataset.cat; render(); }
+  else if (action === 'agregar-frecuente') agregarItem(btn.dataset.cat, [btn.dataset.desc, btn.dataset.uni]);
+  else if (action === 'quitar-item') quitarItem(id);
+  else if (action === 'guardar') guardar();
+  else if (action === 'ver-resumen') irAResumen();
+  else if (action === 'volver-editor') { state.vista = 'editor'; render(); }
+  else if (action === 'copiar-texto') copiarTexto();
+  else if (action === 'imprimir') window.print();
+});
+
+document.addEventListener('input', (e) => {
+  const el = e.target;
+  if (el.dataset.campo) {
+    state.actual[el.dataset.campo] = el.value;
+    render();
+  } else if (el.dataset.itemId && el.dataset.itemCampo) {
+    const item = state.actual.items.find(i => i.id === el.dataset.itemId);
+    if (item) item[el.dataset.itemCampo] = el.value;
+    render();
+  }
+});
+
+/* =========================================================
+   INICIALIZACIÓN
+   ========================================================= */
+cargarPresupuestos();
+render();
+</script>
+</body>
+</html>
